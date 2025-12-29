@@ -34,9 +34,9 @@
 <li><strong>Dwell Time</strong>: Configure how long to look in a direction before page turns</li>
 </ul>
 
-<h2>Browser Compatibility</h2>
+<h2>Browser Compatibility and use</h2>
 
-<p>Any modern web browser really</p>
+<p>Open the LazyRead.html file on any modern web browser</p>
 
 </ul>
 
