@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lazy Read</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    
+    <style>
+        body {
+            margin: 0; background: #1a1a1a; overflow: hidden;
+            font-family: 'Segoe UI', system-ui, sans-serif; color: white;
+            display: flex; justify-content: center;
+        }
+
+        /* PDF Layout */
+        #pdf-viewport {
+            width: 100vw; height: 100vh;
+            display: flex; flex-direction: column; align-items: center;
+            overflow-y: auto; background: #222; scroll-behavior: smooth;
+        }
+        canvas { box-shadow: 0 0 50px rgba(0,0,0,0.8); margin: 40px 0; background: white; }
+
+        /* Navigation Boundary Indicators (Subtle) */
+        .nav-boundary {
+            position: fixed; top: 0; bottom: 0;
+            z-index: 1000; border-left: 1px dashed rgba(255, 255, 255, 0.15);
+            pointer-events: none; transition: left 0.2s, right 0.2s;
+        }
+
+        /* The Ring Cursor */
+        #cursor-container {
+            position: fixed; width: 60px; height: 60px;
+            pointer-events: none; z-index: 3000;
+            transform: translate(-50%, -50%);
+            display: flex; align-items: center; justify-content: center;
+        }
+        #cursor-dot {
+            position: absolute; width: 6px; height: 6px;
+            background: #00ff00; border-radius: 50%;
+            box-shadow: 0 0 10px #00ff00;
+        }
+        /* SVG Ring Logic */
+        #progress-ring { transform: rotate(-90deg); }
+        #progress-ring-circle {
+            stroke: #00ff00;
+            stroke-dasharray: 125.6; /* 2 * PI * 20 */
+            stroke-dashoffset: 125.6;
+            transition: stroke-dashoffset 0.1s linear;
+        }
+
+        /* Sidebar UI */
+        #ui-panel {
+            position: fixed; top: 20px; left: 20px; width: 260px;
+            background: rgba(0,0,0,0.92); padding: 20px; border-radius: 12px;
+            border: 1px solid #444; z-index: 2000;
+        }
+
+        .control-group { margin-bottom: 15px; }
+        label { display: flex; justify-content: space-between; font-size: 11px; color: #aaa; margin-bottom: 4px; }
+        input[type=range] { width: 100%; accent-color: #00ff00; cursor: pointer; }
+        
+        .btn {
+            width: 100%; padding: 10px; border: none; border-radius: 6px;
+            font-weight: bold; cursor: pointer; margin-bottom: 8px; transition: 0.2s;
+        }
+        .btn-primary { background: #00ff00; color: black; }
+        .btn-danger { background: #ff4444; color: white; }
+        .btn-secondary { background: #444; color: white; }
+        
+        #preview-box {
+            position: fixed; bottom: 20px; right: 20px; width: 140px; height: 105px;
+            border-radius: 8px; overflow: hidden; border: 2px solid #333; z-index: 500;
+            background: #000;
+        }
+        video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+    </style>
+</head>
+<body>
+
+    <!-- Subtle Boundary Lines -->
+    <div id="bound-left" class="nav-boundary"></div>
+    <div id="bound-right" class="nav-boundary"></div>
+
+    <!-- Ring Cursor -->
+    <div id="cursor-container">
+        <svg id="progress-ring" width="50" height="50">
+            <circle cx="25" cy="25" r="20" fill="transparent" stroke="rgba(255,255,255,0.2)" stroke-width="4"/>
+            <circle id="progress-ring-circle" cx="25" cy="25" r="20" fill="transparent" stroke-width="4" stroke-linecap="round"/>
+        </svg>
+        <div id="cursor-dot"></div>
+    </div>
+
+    <div id="ui-panel">
+        <h4 style="margin: 0 0 15px 0; color:#00ff00;">Lazy Read</h4>
+        
+        <input type="file" id="file-loader" accept="application/pdf" style="display:none">
+        <button class="btn btn-secondary" onclick="document.getElementById('file-loader').click()">📁 LOAD PDF</button>
+        
+        <button class="btn btn-primary" id="btn-cam-start" onclick="initCam()">📷 START CAMERA</button>
+        <button class="btn btn-danger" id="btn-cam-stop" onclick="stopCam()" style="display:none;">🛑 STOP CAMERA</button>
+
+        <div class="control-group">
+            <label>Sensitivity <span id="v-sx">5</span></label>
+            <input type="range" id="s-x" min="1" max="10" step="0.5" value="5">
+        </div>
+
+        <div class="control-group">
+            <label>Trigger Zone <span id="v-tz">20%</span></label>
+            <input type="range" id="s-tz" min="5" max="40" step="1" value="20">
+        </div>
+
+        <div class="control-group">
+            <label>Dwell Time <span id="v-dw">1.5s</span></label>
+            <input type="range" id="s-dw" min="0.5" max="3" step="0.1" value="1.5">
+        </div>
+
+        <div style="font-size: 12px; text-align: center; color: #888;">
+            Page: <span id="p-curr" style="color:#00ff00">0</span> / <span id="p-total">0</span>
+        </div>
+    </div>
+
+    <div id="pdf-viewport">
+        <canvas id="pdf-render"></canvas>
+    </div>
+
+    <div id="preview-box">
+        <video id="webcam" playsinline></video>
+    </div>
+
+<script>
+    // --- Configuration ---
+    let config = {
+        sensitivity: 5,
+        threshold: 0.20,
+        dwell: 1500,
+        smoothing: 0.15
+    };
+
+    let appState = {
+        pdf: null,
+        pageNum: 1,
+        isRendering: false,
+        stream: null,
+        isRunning: false,
+        curX: window.innerWidth / 2,
+        curY: window.innerHeight / 2,
+        currentZone: 'none',
+        zoneStartTime: null,
+        lastFlipTime: 0
+    };
+
+    const circ = 2 * Math.PI * 20; // Circumference for SVG ring
+    const ringCircle = document.getElementById('progress-ring-circle');
+
+    // --- PDF Logic ---
+    const pdfjs = window['pdfjs-dist/build/pdf'];
+    pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+    document.getElementById('file-loader').onchange = (e) => {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = async function() {
+            appState.pdf = await pdfjs.getDocument({data: new Uint8Array(this.result)}).promise;
+            document.getElementById('p-total').textContent = appState.pdf.numPages;
+            renderPage(1);
+        };
+        reader.readAsArrayBuffer(file);
+    };
+
+    async function renderPage(num) {
+        if (appState.isRendering || !appState.pdf) return;
+        appState.isRendering = true;
+        const page = await appState.pdf.getPage(num);
+        const canvas = document.getElementById('pdf-render');
+        const viewport = page.getViewport({ scale: 1.5 });
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        appState.pageNum = num;
+        document.getElementById('p-curr').textContent = num;
+        appState.isRendering = false;
+    }
+
+    // --- Navigation & Ring Progress ---
+    function updateProgress(x) {
+        const width = window.innerWidth;
+        const leftBound = width * config.threshold;
+        const rightBound = width * (1 - config.threshold);
+
+        let activeZone = 'none';
+        if (x < leftBound) activeZone = 'left';
+        else if (x > rightBound) activeZone = 'right';
+
+        const now = Date.now();
+
+        if (activeZone !== appState.currentZone) {
+            appState.currentZone = activeZone;
+            appState.zoneStartTime = activeZone !== 'none' ? now : null;
+            setRing(0);
+        }
+
+        if (appState.currentZone !== 'none' && (now - appState.lastFlipTime > 1500)) {
+            const elapsed = now - appState.zoneStartTime;
+            const percent = Math.min(elapsed / config.dwell, 1);
+            setRing(percent);
+
+            if (percent >= 1) {
+                executeFlip(appState.currentZone);
+                appState.lastFlipTime = now;
+                appState.zoneStartTime = null;
+                setRing(0);
+            }
+        } else if (appState.currentZone === 'none') {
+            setRing(0);
+        }
+    }
+
+    function setRing(percent) {
+        const offset = circ - (percent * circ);
+        ringCircle.style.strokeDashoffset = offset;
+    }
+
+    function executeFlip(dir) {
+        if (dir === 'right' && appState.pageNum < appState.pdf.numPages) renderPage(appState.pageNum + 1);
+        if (dir === 'left' && appState.pageNum > 1) renderPage(appState.pageNum - 1);
+    }
+
+    // --- UI Helpers ---
+    function updateBoundaryUI() {
+        const widthPx = window.innerWidth * config.threshold;
+        document.getElementById('bound-left').style.left = widthPx + 'px';
+        document.getElementById('bound-right').style.right = widthPx + 'px';
+    }
+
+    document.getElementById('s-x').oninput = (e) => {
+        config.sensitivity = parseFloat(e.target.value);
+        document.getElementById('v-sx').innerText = config.sensitivity;
+    };
+    document.getElementById('s-tz').oninput = (e) => {
+        config.threshold = parseFloat(e.target.value) / 100;
+        document.getElementById('v-tz').innerText = e.target.value + '%';
+        updateBoundaryUI();
+    };
+    document.getElementById('s-dw').oninput = (e) => {
+        config.dwell = parseFloat(e.target.value) * 1000;
+        document.getElementById('v-dw').innerText = e.target.value + 's';
+    };
+
+    // --- Camera Control ---
+    async function initCam() {
+        appState.isRunning = true;
+        document.getElementById('btn-cam-start').style.display = 'none';
+        document.getElementById('btn-cam-stop').style.display = 'block';
+        
+        const video = document.getElementById('webcam');
+        const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+        faceMesh.setOptions({ maxNumFaces: 1, minDetectionConfidence: 0.6 });
+        faceMesh.onResults(onResults);
+
+        appState.stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+        video.srcObject = appState.stream;
+        video.play();
+
+        async function loop() {
+            if (!appState.isRunning) return;
+            await faceMesh.send({image: video});
+            requestAnimationFrame(loop);
+        }
+        loop();
+        updateBoundaryUI();
+    }
+
+    function stopCam() {
+        appState.isRunning = false;
+        if (appState.stream) {
+            appState.stream.getTracks().forEach(track => track.stop());
+        }
+        document.getElementById('btn-cam-start').style.display = 'block';
+        document.getElementById('btn-cam-stop').style.display = 'none';
+        document.getElementById('cursor-container').style.opacity = '0';
+    }
+
+    function onResults(results) {
+        if (!appState.isRunning) return;
+        document.getElementById('cursor-container').style.opacity = '1';
+        
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+            const nose = results.multiFaceLandmarks[0][1];
+            
+            const dx = (nose.x - 0.5) * config.sensitivity;
+            const dy = (nose.y - 0.5) * config.sensitivity;
+
+            let targetX = (0.5 - dx) * window.innerWidth;
+            let targetY = (0.5 + dy) * window.innerHeight;
+
+            appState.curX += (targetX - appState.curX) * config.smoothing;
+            appState.curY += (targetY - appState.curY) * config.smoothing;
+
+            const cursor = document.getElementById('cursor-container');
+            cursor.style.left = appState.curX + 'px';
+            cursor.style.top = appState.curY + 'px';
+            
+            updateProgress(appState.curX);
+        }
+    }
+
+    window.onresize = updateBoundaryUI;
+</script>
+</body>
+</html>
